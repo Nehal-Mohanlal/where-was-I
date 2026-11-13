@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Location Calendar</title>
+<style>
+  :root { --bg:#14161a; --card:#1e2127; --text:#e8eaed; --muted:#8b919a; --red:#ff3b3b; --line:#2c3038; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; }
+  h1 { margin:0 0 16px; font-size:22px; }
+  .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:end; background:var(--card); padding:16px; border-radius:12px; margin-bottom:24px; }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); gap:4px; }
+  input[type=text], input[type=number] { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; font-size:14px; }
+  input[type=text] { width:230px; } input[type=number] { width:90px; }
+  button { background:var(--red); color:#fff; border:0; border-radius:6px; padding:9px 16px; font-size:14px; cursor:pointer; }
+  #status { color:var(--muted); font-size:13px; margin:-8px 0 16px; min-height:18px; }
+  .months { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:20px; }
+  .month { background:var(--card); border-radius:12px; padding:16px; }
+  .month h2 { margin:0 0 10px; font-size:16px; }
+  .grid { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+  .dow { font-size:11px; color:var(--muted); text-align:center; padding-bottom:4px; }
+  .day { position:relative; aspect-ratio:1; border:1px solid var(--line); border-radius:6px; font-size:11px; padding:3px 5px; color:var(--muted); }
+  .day.blank { border:0; }
+  .day.data::after { content:""; position:absolute; right:5px; bottom:5px; width:5px; height:5px; border-radius:50%; background:#4a90e2; }
+  .day.hit { color:var(--text); }
+  .day.hit .x { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:34px; font-weight:900; color:var(--red); line-height:1; pointer-events:none; }
+  .day.today { outline:1px solid var(--muted); }
+  .legend { color:var(--muted); font-size:12px; margin-top:20px; }
+</style>
+</head>
+<body>
+<h1>Where was I?</h1>
+
+<div class="controls">
+  <label>Location (lat, lng)<input type="text" id="loc" value="-25.9684357, 28.1287703"></label>
+  <label>Radius (m)<input type="number" id="radius" value="150" min="10"></label>
+  <label>Months<input type="number" id="months" value="3" min="1" max="12"></label>
+  <label>Google Maps JSON<input type="file" id="file" accept=".json,application/json"></label>
+  <button id="go">Redraw</button>
+</div>
+<div id="status">Pick your exported JSON file. It's read locally in your browser and never uploaded.</div>
+<div class="months" id="out"></div>
+<div class="legend">Red X = at least one point (or visit) within the radius that day. Blue dot = you have location data that day. Hover a day for details.</div>
+
+<script>
+let data = null; // parsed JSON, kept in memory so radius changes don't need a re-load
+
+const $ = id => document.getElementById(id);
+const pad = n => String(n).padStart(2, "0");
+const key = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+
+function parseLL(s) {
+  if (!s || typeof s !== "string") return null;
+  const p = s.split(",");
+  if (p.length !== 2) return null;
+  const lat = parseFloat(p[0]), lng = parseFloat(p[1]);
+  return isNaN(lat) || isNaN(lng) ? null : [lat, lng];
+}
+
+function haversine(a, b) {
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * rad, dLng = (b[1] - a[1]) * rad;
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// every local date key from startKey to endKey inclusive (dates taken straight from the string, no UTC shift)
+function* dayRange(startKey, endKey) {
+  let [y, m, d] = startKey.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  for (let i = 0; i < 400; i++) {
+    const k = dt.toISOString().slice(0, 10);
+    if (k > endKey) return;
+    yield k;
+    dt.setUTCDate(dt.getUTCDate() + 1);
+  }
+}
+
+function analyse(target, radius, minKey, maxKey) {
+  const days = new Map();
+  const get = k => {
+    let o = days.get(k);
+    if (!o) days.set(k, o = { min: Infinity, n: 0, first: null, last: null });
+    return o;
+  };
+  const mark = (k, dist, t1, t2) => {
+    const o = get(k);
+    if (dist < o.min) o.min = dist;
+    if (dist <= radius) {
+      o.n++;
+      if (!o.first || t1 < o.first) o.first = t1;
+      if (!o.last || t2 > o.last) o.last = t2;
+    }
+  };
+
+  for (const seg of data.semanticSegments || []) {
+    // raw GPS path points
+    if (seg.timelinePath) {
+      for (const p of seg.timelinePath) {
+        const k = p.time && p.time.slice(0, 10);
+        if (!k || k < minKey || k > maxKey) continue;
+        const ll = parseLL(p.point);
+        if (!ll) continue;
+        const t = p.time.slice(11, 16);
+        mark(k, haversine(target, ll), t, t);
+      }
+    }
+    // place visits (if present in the export)
+    if (seg.visit && seg.startTime && seg.endTime) {
+      const ll = parseLL(seg.visit.topCandidate && seg.visit.topCandidate.placeLocation && seg.visit.topCandidate.placeLocation.latLng);
+      if (!ll) continue;
+      const sk = seg.startTime.slice(0, 10), ek = seg.endTime.slice(0, 10);
+      if (ek < minKey || sk > maxKey) continue;
+      const dist = haversine(target, ll);
+      for (const k of dayRange(sk, ek)) {
+        if (k < minKey || k > maxKey) continue;
+        mark(k, dist, k === sk ? seg.startTime.slice(11, 16) : "00:00", k === ek ? seg.endTime.slice(11, 16) : "23:59");
+      }
+    }
+  }
+  return days;
+}
+
+function render() {
+  if (!data) return;
+  const target = parseLL($("loc").value);
+  if (!target) { $("status").textContent = "Couldn't read the location. Use the form: -25.96, 28.12"; return; }
+  const radius = Number($("radius").value) || 150;
+  const nMonths = Math.max(1, Number($("months").value) || 3);
+
+  const now = new Date();
+  const todayKey = key(now.getFullYear(), now.getMonth(), now.getDate());
+  const first = new Date(now.getFullYear(), now.getMonth() - (nMonths - 1), 1);
+  const minKey = key(first.getFullYear(), first.getMonth(), 1);
+
+  const days = analyse(target, radius, minKey, todayKey);
+  const out = $("out");
+  out.innerHTML = "";
+  let hitDays = 0;
+
+  for (let i = 0; i < nMonths; i++) {
+    const ref = new Date(first.getFullYear(), first.getMonth() + i, 1);
+    const y = ref.getFullYear(), m = ref.getMonth();
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    const offset = (ref.getDay() + 6) % 7; // Monday first
+
+    const box = document.createElement("div");
+    box.className = "month";
+    box.innerHTML = `<h2>${ref.toLocaleString("en", { month: "long", year: "numeric" })}</h2>`;
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].forEach(n => grid.insertAdjacentHTML("beforeend", `<div class="dow">${n}</div>`));
+    for (let b = 0; b < offset; b++) grid.insertAdjacentHTML("beforeend", `<div class="day blank"></div>`);
+
+    for (let d = 1; d <= lastDay; d++) {
+      const k = key(y, m, d), info = days.get(k);
+      const el = document.createElement("div");
+      el.className = "day";
+      el.textContent = d;
+      if (k === todayKey) el.classList.add("today");
+      if (info) {
+        el.classList.add("data");
+        if (info.n > 0) {
+          hitDays++;
+          el.classList.add("hit");
+          el.insertAdjacentHTML("beforeend", `<span class="x">✕</span>`);
+          el.title = `${k}: ${info.n} matching point(s), ${info.first}–${info.last}`;
+        } else {
+          el.title = `${k}: not there. Closest point was ${Math.round(info.min)} m away`;
+        }
+      } else if (k <= todayKey) {
+        el.title = `${k}: no location data`;
+      }
+      grid.appendChild(el);
+    }
+    box.appendChild(grid);
+    out.appendChild(box);
+  }
+  $("status").textContent = `${hitDays} day(s) at that location in the last ${nMonths} month(s), radius ${radius} m.`;
+}
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("status").textContent = `Reading ${f.name} (${(f.size / 1048576).toFixed(0)} MB)…`;
+  try {
+    data = JSON.parse(await f.text());
+    if (!data.semanticSegments) throw new Error("No 'semanticSegments' found. Is this the right export?");
+    render();
+  } catch (err) {
+    $("status").textContent = "Failed: " + err.message;
+  }
+});
+$("go").addEventListener("click", render);
+</script>
+</body>
+</html>
